@@ -22,61 +22,63 @@ class DataManager:
     def fetch_data(self, ticker, start_str, end_str):
         """
         주어진 기간 동안의 5분봉 데이터를 페이지네이션을 통해 모두 가져옵니다.
+        사용자 입력(KST)을 UTC로 변환하여 요청하고, 결과는 다시 KST로 복구합니다.
         
         Args:
             ticker (str): 심볼 (예: 'ETH/USDT')
-            start_str (str): 시작 시간 (YYYY.MM.DD.HH)
-            end_str (str): 종료 시간 (YYYY.MM.DD.HH)
-        
-        Returns:
-            pd.DataFrame: OHLCV 데이터
+            start_str (str): 시작 시간 (KST 기준 YYYY.MM.DD.HH)
+            end_str (str): 종료 시간 (KST 기준 YYYY.MM.DD.HH)
         """
-        # 시간 포맷 파싱
         try:
-            since = self.exchange.parse8601(datetime.strptime(start_str, "%Y.%m.%d.%H").isoformat())
-            end_ts = self.exchange.parse8601(datetime.strptime(end_str, "%Y.%m.%d.%H").isoformat())
+            # 1. 입력된 KST 시간을 datetime 객체로 변환
+            kst_start = datetime.strptime(start_str, "%Y.%m.%d.%H")
+            kst_end = datetime.strptime(end_str, "%Y.%m.%d.%H")
+            
+            # 2. API 요청을 위해 UTC로 변환 (KST - 9시간)
+            utc_start = kst_start - timedelta(hours=9)
+            utc_end = kst_end - timedelta(hours=9)
+            
+            # CCXT용 타임스탬프(ms) 생성
+            since = self.exchange.parse8601(utc_start.isoformat())
+            end_ts = self.exchange.parse8601(utc_end.isoformat())
+            
         except Exception as e:
             raise ValueError(f"날짜 형식이 올바르지 않습니다. (YYYY.MM.DD.HH): {e}")
 
         all_ohlcv = []
-        limit = 1000  # 바이낸스 최대 요청 개수
-        
+        limit = 1000
         current_since = since
         
         while current_since < end_ts:
             try:
-                # 데이터 가져오기 (5분봉)
                 ohlcv = self.exchange.fetch_ohlcv(ticker, timeframe='5m', since=current_since, limit=limit)
-                
                 if not ohlcv:
                     break
                 
                 all_ohlcv.extend(ohlcv)
-                
-                # 다음 요청을 위해 시간 업데이트 (마지막 캔들 시간 + 5분)
                 last_candle_time = ohlcv[-1][0]
                 current_since = last_candle_time + (5 * 60 * 1000)
                 
-                # 종료 시간 도달 확인
                 if last_candle_time >= end_ts:
                     break
                     
-                # API 레이트 리밋 조절
                 time.sleep(0.1)
-                
             except Exception as e:
                 print(f"데이터 수집 중 오류: {e}")
-                time.sleep(1) # 오류 시 잠시 대기 후 재시도
+                time.sleep(1)
         
-        # 데이터프레임 변환
+        # 3. 데이터프레임 변환 및 시간대 복구
         df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        
+        # UTC 타임스탬프를 datetime으로 변환 후 KST(+9)로 시프트
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms') + timedelta(hours=9)
         df.set_index('timestamp', inplace=True)
         
-        # 중복 제거 및 시간 범위 자르기
+        # 중복 제거
         df = df[~df.index.duplicated(keep='first')]
-        df = df[(df.index >= pd.to_datetime(start_str, format="%Y.%m.%d.%H")) & 
-                (df.index <= pd.to_datetime(end_str, format="%Y.%m.%d.%H"))]
+        
+        # KST 기준으로 최종 필터링
+        df = df[(df.index >= kst_start) & (df.index <= kst_end)]
         
         return df
 
@@ -148,23 +150,15 @@ class Analyzer:
         
         return df
 
-    def scan_and_label(self, df, threshold_pct, detection_window_min, hold_time_min, ticker, tier, market_regime, history_len):
+    def scan_and_label(self, df, threshold_pct, detection_window_min, hold_time_min, ticker, tier, market_regime, history_len, sl_percent=2.0, rr_ratio=2.0):
         """
         이벤트를 스캔하고 라벨링(Type 1, 2, 3) 및 시각화를 수행합니다.
         
-        업데이트 사항:
-        1. Type 3 (Bottom Consolidation) 로직 추가
-        2. 이벤트 발생 시 검증 차트(PNG) 저장 기능 추가
-        3. [New] 데이터 카테고리화 (Tier, Market) 및 가변적 히스토리 길이 적용
-        
-        Args:
-            df (pd.DataFrame): 지표가 계산된 데이터프레임
-            threshold_pct (float): 감지 임계값 (%)
-            detection_window_min (int): 감지 윈도우 (분)
-            hold_time_min (int): 보유 시간 (분)
-            tier (str): 코인 체급
-            market_regime (str): 장세 정보
-            history_len (int): 과거 데이터 조회 길이 (Look-back Window)
+        [V4.0 업데이트] Risk:Reward (R:R) 로직 적용
+        - TP (Target Price) = 진입가 ± (SL% * R:R)
+        - SL 도달 시: Type 2 (Loss)
+        - TP 도달 시: Type 1 (Win)
+        - 시간 초과: Type 3 (Draw)
         """
         results = []
         
@@ -182,18 +176,21 @@ class Analyzer:
         
         target_features = ['close', 'rsi', 'macd', 'obv', 'vol_ratio', 'ema_z_score']
         
-        # history_len은 사용자 입력값 사용 (기존 하드코딩 288 제거)
-        start_idx = max(history_len, window_candles) + 50 # 시각화 여유분 확보를 위해 약간 더 뒤에서 시작 가능
+        # history_len은 사용자 입력값 사용
+        start_idx = max(history_len, window_candles) + 50 
         
         thresh = threshold_pct / 100.0
+        sl_rate = sl_percent / 100.0
         
-        print(f"스캔 시작: {len(df)} 캔들 분석 중...")
+        print(f"스캔 시작: {len(df)} 캔들 분석 중... (SL: {sl_percent}%, R:R: {rr_ratio})")
         
         closes = df['close'].values
+        highs = df['high'].values
+        lows = df['low'].values
         timestamps = df.index
         
         i = start_idx
-        last_idx = len(df) - hold_candles - 50 # 시각화 여유분 고려
+        last_idx = len(df) - hold_candles - 50 
         
         next_scan_idx = 0 
         
@@ -213,65 +210,62 @@ class Analyzer:
             # 변동률 계산
             pct_change = (current_close - past_close) / past_close
             
-            # 이벤트 감지
+            # 이벤트 감지 (Impulse)
             if abs(pct_change) >= thresh:
                 
-                event_type = "Unknown"
                 direction = 1 if pct_change > 0 else -1
                 entry_price = current_close
                 
-                # 미래 데이터 윈도우 추출 (Hold Time)
-                future_window = closes[i+1 : i+1+hold_candles]
+                # R:R 기반 TP/SL 계산
+                if direction == 1: # Long
+                    sl_price = entry_price * (1 - sl_rate)
+                    tp_price = entry_price * (1 + (sl_rate * rr_ratio))
+                else: # Short
+                    sl_price = entry_price * (1 + sl_rate)
+                    tp_price = entry_price * (1 - (sl_rate * rr_ratio))
                 
-                if len(future_window) < hold_candles:
-                    i += 1
-                    continue
+                # 결과 판정 (캔들 단위 시뮬레이션)
+                event_type = "Type 3 (Draw/Timeout)" # 기본값
                 
-                if direction == 1: # 상승 임펄스 (Long)
-                    move_size = entry_price - past_close
-                    retrace_threshold = entry_price - (move_size * 0.7) # 70% 되돌림
+                # 미래 윈도우 순회
+                for h in range(1, hold_candles + 1):
+                    idx = i + h
+                    # 고가/저가 확인 (꼬리 포함)
+                    curr_high = highs[idx]
+                    curr_low = lows[idx]
                     
-                    min_price = np.min(future_window)
-                    
-                    if min_price < retrace_threshold:
-                        event_type = "Type 2 (Fake-out)"
-                    else:
-                        event_type = "Type 1 (Success)"
-                        
-                else: # 하락 임펄스 (Short)
-                    move_size = past_close - entry_price # 하락폭 (양수)
-                    
-                    # 기준값 계산
-                    max_price = np.max(future_window)
-                    min_price = np.min(future_window)
-                    
-                    retrace_threshold_fakeout = entry_price + (move_size * 0.7) # 70% 되돌림 (Type 2 기준)
-                    
-                    # Type 3 (Bottom Consolidation) 조건
-                    # 1. 반등(V-bounce)이 약함: 되돌림이 50% 이하
-                    cond_no_bounce = max_price <= entry_price + (move_size * 0.5)
-                    # 2. 추가 하락이 제한적: 초기 임펄스의 20% 이상 더 떨어지지 않음
-                    cond_no_crash = min_price >= entry_price - (move_size * 0.2)
-                    
-                    if max_price > retrace_threshold_fakeout:
-                        event_type = "Type 2 (Fake-out)"
-                    elif cond_no_bounce and cond_no_crash:
-                        event_type = "Type 3 (Bottom Consolidation)"
-                    else:
-                        # 위 조건에 해당하지 않으면(예: 그대로 더 폭락하거나, 적당한 반등 후 횡보 등)
-                        # 여기서는 단순 추세 지속(Success)으로 분류
-                        event_type = "Type 1 (Success)"
+                    if direction == 1: # Long
+                        # SL 체크 (Low가 SL 터치)
+                        if curr_low <= sl_price:
+                            event_type = "Type 2 (Loss)"
+                            break # 종료
+                        # TP 체크 (High가 TP 터치)
+                        if curr_high >= tp_price:
+                            event_type = "Type 1 (Win)"
+                            break # 종료
+                    else: # Short
+                        # SL 체크 (High가 SL 터치)
+                        if curr_high >= sl_price:
+                            event_type = "Type 2 (Loss)"
+                            break
+                        # TP 체크 (Low가 TP 터치)
+                        if curr_low <= tp_price:
+                            event_type = "Type 1 (Win)"
+                            break
                 
                 # --- Feature Flattening ---
                 row_data = {
                     'timestamp': timestamps[i],
                     'ticker': ticker,
-                    'coin_tier': tier,         # [New]
-                    'market_regime': market_regime, # [New]
+                    'coin_tier': tier,
+                    'market_regime': market_regime,
                     'event_type': event_type,
                     'direction': 'Long' if direction == 1 else 'Short',
                     'pct_change': pct_change,
-                    'entry_price': entry_price
+                    'entry_price': entry_price,
+                    'sl_price': sl_price, # [New]
+                    'tp_price': tp_price, # [New]
+                    'target_rr': rr_ratio # [New]
                 }
                 
                 slice_start = i - history_len + 1
@@ -280,17 +274,19 @@ class Analyzer:
                 for feature in target_features:
                     feat_values = df[feature].iloc[slice_start:slice_end].values
                     if len(feat_values) != history_len: continue
-                    # 동적 히스토리 길이 적용
                     for lag in range(history_len):
                         val = feat_values[(history_len - 1) - lag]
                         row_data[f'{feature}_lag_{lag}'] = val
                 
                 results.append(row_data)
                 
-                # --- Event Visualization (차트 저장) ---
+                # --- Event Visualization ---
                 try:
                     direction_str = 'Long' if direction == 1 else 'Short'
-                    self._save_verification_chart(df, i, hold_candles, ticker, event_type, history_len, direction_str)
+                    self._save_verification_chart(
+                        df, i, hold_candles, ticker, event_type, history_len, 
+                        direction_str, sl_price, sl_percent, tp_price, rr_ratio
+                    )
                 except Exception as e:
                     print(f"차트 저장 실패: {e}")
 
@@ -301,16 +297,11 @@ class Analyzer:
 
         return pd.DataFrame(results)
 
-    def _save_verification_chart(self, df, current_idx, hold_candles, ticker, event_type, history_len, direction_str):
+    def _save_verification_chart(self, df, current_idx, hold_candles, ticker, event_type, history_len, direction_str, sl_price, sl_percent, tp_price, rr_ratio):
         """
-        이벤트 발생 시점의 검증 차트를 생성하고 저장합니다.
-        
-        Args:
-            current_idx (int): 이벤트 발생 캔들 인덱스 (T)
-            history_len (int): 피처 추출 구간 길이
-            direction_str (str): 매매 방향 ('Long' 또는 'Short')
+        이벤트 발생 시점의 검증 차트 저장 (SL & TP 라인 포함)
         """
-        # 시각화 범위 설정 (과거 350개 ~ 미래 50개 + 홀드기간)
+        # 시각화 범위
         plot_start = max(0, current_idx - 350)
         plot_end = min(len(df), current_idx + hold_candles + 50)
         
@@ -318,67 +309,68 @@ class Analyzer:
         timestamps = subset.index
         closes = subset['close'].values
         
-        # 현재 시점(T)의 상대적 인덱스 찾기
-        # 전체 df에서의 인덱스가 current_idx이므로, subset 내에서는:
         rel_idx = current_idx - plot_start
         
-        plt.figure(figsize=(12, 7)) # 가로 폭을 약간 넓힘
+        plt.figure(figsize=(12, 7))
         
-        # 1. Close Price Plot (X축을 Timestamp로 변경)
+        # 1. Close Price
         plt.plot(timestamps, closes, color='black', linewidth=1, label='Close Price')
         
-        # --- Multi-Timeframe EMA Lines 추가 ---
-        # 1. 5m 224 EMA (Blue, Solid, 1.5)
+        # --- EMAs ---
         if 'ema_224' in subset.columns:
             plt.plot(timestamps, subset['ema_224'], color='blue', linestyle='-', linewidth=1.5, label='5m 224 EMA')
-            
-        # 2. 15m 224 EMA (Green, Dashed, 1.5)
         if 'ema_224_15m' in subset.columns:
             plt.plot(timestamps, subset['ema_224_15m'], color='green', linestyle='--', linewidth=1.5, label='15m 224 EMA')
-            
-        # 3. 1h 224 EMA (Hotpink, Solid, 2.0)
         if 'ema_224_1h' in subset.columns:
             plt.plot(timestamps, subset['ema_224_1h'], color='hotpink', linestyle='-', linewidth=2.0, label='1h 224 EMA')
-            
-        # 4. 4h 224 EMA (Purple, Solid, 2.5)
         if 'ema_224_4h' in subset.columns:
             plt.plot(timestamps, subset['ema_224_4h'], color='purple', linestyle='-', linewidth=2.5, label='4h 224 EMA')
         
-        # 2. Feature Extraction Zone (Yellow, Past N)
-        # T - history_len ~ T
+        # 2. Zones
         feat_start_rel = max(0, rel_idx - history_len)
         plt.axvspan(timestamps[feat_start_rel], timestamps[rel_idx], color='yellow', alpha=0.2, label='Feature Zone')
         
-        # 3. Hold Time Zone (Green, Future)
-        # T ~ T + Hold
         hold_end_rel = min(len(subset)-1, rel_idx + hold_candles)
         plt.axvspan(timestamps[rel_idx], timestamps[hold_end_rel], color='green', alpha=0.1, label='Hold Zone')
         
-        # 4. Event Point (Directional Marker)
+        # 3. Lines (SL & TP)
+        # SL Line (Red Dashed)
+        plt.hlines(y=sl_price, xmin=timestamps[rel_idx], xmax=timestamps[hold_end_rel], 
+                   colors='red', linestyles='--', linewidth=1.5, label=f'SL (-{sl_percent}%)')
+        
+        # TP Line (Green Dashed) [New]
+        plt.hlines(y=tp_price, xmin=timestamps[rel_idx], xmax=timestamps[hold_end_rel], 
+                   colors='green', linestyles='--', linewidth=1.5, label=f'TP (R:R {rr_ratio})')
+
+        # 4. Markers
         if direction_str == 'Long':
             plt.scatter([timestamps[rel_idx]], [closes[rel_idx]], color='green', marker='^', s=100, zorder=10, label='Long Entry')
         else:
             plt.scatter([timestamps[rel_idx]], [closes[rel_idx]], color='red', marker='v', s=100, zorder=10, label='Short Entry')
         
-        # 5. X-axis Formatting (Date/Time)
+        # 5. Formatting
         ax = plt.gca()
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%y.%m.%d.%H.%M'))
         ax.xaxis.set_major_locator(mdates.AutoDateLocator())
         plt.xticks(rotation=45, ha='right')
 
-        # 타이틀 및 파일명 정리
         t_str = df.index[current_idx].strftime("%Y%m%d_%H%M")
-        clean_event = event_type.replace(" ", "_").replace("(", "").replace(")", "")
+        
+        # 파일명 단순화 (Type_1_Win, Type_2_Loss)
+        short_event = event_type.split('(')[0].strip().replace(" ", "_")
+        if "Win" in event_type: short_event += "_Win"
+        elif "Loss" in event_type: short_event += "_Loss"
+        else: short_event += "_Draw"
+            
         title = f"{ticker} | {t_str} | {event_type} | [{direction_str}]"
         
         plt.title(title)
-        plt.legend(loc='best') # 범례 위치 자동 최적화
+        plt.legend(loc='best')
         plt.grid(True, alpha=0.3)
-        plt.tight_layout() # 레이아웃 자동 조정 (라벨 잘림 방지)
+        plt.tight_layout()
         
-        # 파일 저장
-        filename = f"{ticker.replace('/', '')}_{t_str}_{clean_event}.png"
+        filename = f"{ticker.replace('/', '')}_{t_str}_{short_event}.png"
         filepath = os.path.join(self.chart_dir, filename)
         
         plt.savefig(filepath)
-        plt.close() # 메모리 누수 방지
+        plt.close()

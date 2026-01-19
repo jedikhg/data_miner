@@ -47,8 +47,10 @@ class Worker(QThread):
             tier = self.params['tier']
             market = self.params['market']
             history_len = int(self.params['history_len'])
+            sl_percent = float(self.params.get('sl_percent', 2.0))
+            rr_ratio = float(self.params.get('rr_ratio', 2.0)) # [New V4.0]
 
-            self.log_signal.emit(f"=== 작업 시작: {ticker} ===")
+            self.log_signal.emit(f"=== 작업 시작: {ticker} (SL: {sl_percent}%, R:R: {rr_ratio}) ===")
             self.progress_signal.emit(10)
 
             # 1. 데이터 수집
@@ -73,7 +75,7 @@ class Worker(QThread):
             # 파라미터 전달 업데이트
             results_df = analyzer.scan_and_label(
                 df_features, threshold, window, hold_time, ticker,
-                tier, market, history_len
+                tier, market, history_len, sl_percent, rr_ratio
             )
             
             self.progress_signal.emit(90)
@@ -115,7 +117,7 @@ class MainApp(QMainWindow):
         self.end_input = QLineEdit("2024.01.05.00")
         self.threshold_input = QLineEdit("3.0")
         self.window_input = QLineEdit("60")
-        self.hold_input = QLineEdit("120")
+        self.hold_input = QLineEdit("2880")
         
         # 신규 입력 필드 추가
         self.tier_input = QComboBox()
@@ -124,7 +126,9 @@ class MainApp(QMainWindow):
         self.market_input = QComboBox()
         self.market_input.addItems(['Mixed (복합)', 'Bull (불장)', 'Bear (하락장)', 'Sideways (횡보장)'])
         
-        self.history_input = QLineEdit("288")
+        self.history_input = QLineEdit("576")
+        self.sl_input = QLineEdit("2.5") # [New V3.0] SL Input
+        self.rr_input = QLineEdit("2.0") # [New V4.0] R:R Input
         
         form_layout.addRow("Ticker (심볼):", self.ticker_input)
         form_layout.addRow("Start Date (YYYY.MM.DD.HH):", self.start_input)
@@ -137,6 +141,8 @@ class MainApp(QMainWindow):
         form_layout.addRow("코인 체급 (Tier):", self.tier_input)
         form_layout.addRow("장세 (Market):", self.market_input)
         form_layout.addRow("과거 패턴 길이 (캔들 수):", self.history_input)
+        form_layout.addRow("손절 설정 (SL %):", self.sl_input)
+        form_layout.addRow("목표 손익비 (R:R):", self.rr_input) # [New V4.0]
         
         layout.addLayout(form_layout)
 
@@ -170,7 +176,9 @@ class MainApp(QMainWindow):
             # 신규 파라미터 수집
             'tier': self.tier_input.currentText(),
             'market': self.market_input.currentText(),
-            'history_len': self.history_input.text()
+            'history_len': self.history_input.text(),
+            'sl_percent': self.sl_input.text(), # [New V3.0]
+            'rr_ratio': self.rr_input.text()    # [New V4.0]
         }
         
         # 버튼 비활성화

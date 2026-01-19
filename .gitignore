@@ -1,0 +1,6 @@
+__pycache__/
+*.csv
+verification_charts/
+backtest_results/
+reports/
+*.pyc

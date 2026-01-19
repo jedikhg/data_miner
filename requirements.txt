@@ -1,0 +1,5 @@
+ccxt
+pyside6
+pandas
+numpy
+requests
